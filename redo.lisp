@@ -5,7 +5,7 @@
 ;; Make Jobserver (obvious since we don't support -j anyway)
 
 (in-package #:redo)
-(declaim (optimize (speed 3)))
+(declaim (optimize (speed 0)))
 
 (defvar *out-of-date-cache* (make-hash-table :test #'equal))
 
@@ -469,7 +469,24 @@ The file's directory must at least exist"
 		  (and (iolib/os:file-exists-p target)
 		      (< old-stamp (get-file-nsec target))))
 	     (return t))
-	    (t nil)))))))
+	    (t nil)))
+	  
+     #|
+     (loop for (target old-type . old-stamp) in (dbinfo-deps dbinfo)
+	for (new-type . new-stamp) in
+	  (mapcar (compose #'get-stamp #'car)  (dbinfo-deps dbinfo))
+	when
+	  (or
+	   (not (eql old-type new-type))
+	   (eql old-type :always)
+	   (and (eql old-type :time)
+		(< old-stamp new-stamp))
+	   (and (eql old-type :hash)
+		(string/= old-stamp new-stamp)))
+	return t
+	finally (return nil))
+     |#
+     ))))
 
 (defun main (args)
   (error-fmt "ARGS: ~A~%~%" args)
@@ -506,6 +523,44 @@ The file's directory must at least exist"
     (cons (subseq string 0 pos)
 	  (subseq string (1+ pos)))))
 
+(defun server-main (args)
+  (setup-env)
+  (multiple-value-bind (server-control client-control)
+      (iolib/sockets:make-socket-pair)
+    (setf (iolib/os:environment-variable "REDO_SERVER_SOCKFD")
+	  (format nil "~D"
+		  (iolib/sockets:socket-os-fd client-control))
+	  (iolib/os:environment-variable "PATH")
+	  (format nil "~A:~A"
+		  *path-to-redo-dir*
+		  (iolib/os:environment-variable "PATH")))
+    (let ((pid (iolib/syscalls:fork)))
+      (when (= pid 0)
+	(loop
+	   (let* ((args (read-nul-string-list server-control))
+		  (pid (parse-integer (read-nul-string server-control)))
+		  (cwd (read-nul-string server-control))
+		  (env-vars (read-nul-string-list server-control)))
+	     (when (= (length args) 0) (isys:exit 0))
+	     (iolib/os:clear-environment)
+	     (loop for
+		  (var . val) in (mapcar #'split-env env-vars)
+		do (setf (iolib/os:environment-variable var) val))
+	     (when (= 0 (isys:fork))
+		 (iolib/os:with-current-directory cwd
+		   (let ((rv (main args)))
+		     (error-fmt "Client main done: ~D~%" rv)
+		     (isys:kill pid
+				(if (= 0 rv) isys:SIGUSR1 isys:SIGUSR2)))
+		   (isys:exit 0))))))
+      (let ((rv (main args)))
+	(error-fmt "Finished main, exiting~%")
+	(isys:kill pid isys:SIGKILL)
+	;(write-sequence (make-string 40 :initial-element #\Nul) client-control)
+	;(finish-output server-control)
+	(isys:waitpid pid 0)
+	(isys:exit rv)))))
+
 (defun redo-main (args)
   (catch 'exit
     ;Nested invocations of redo establish a new environment for building
@@ -523,6 +578,18 @@ The file's directory must at least exist"
       (error-write (format nil "Redo:~{ ~A~}~%" targets))
       ;(mapc #'out-of-date-p targets) ; will build deps
       (mapc #'run-target targets))
+    0))
+
+(defun redo-stamp2-main (args)
+  (setup-env)
+  (catch 'exit
+    (let ((stamp (second args)))
+      (let* ((redo-current-target (iolib/os:environment-variable "REDO_CURRENT_TARGET")))
+	(when (iolib/os:environment-variable "REDO_CURRENT_TARGET")
+	  (let*
+	      ((target-dbinfo (db-file-info redo-current-target)))
+	    (setf (dbinfo-stamp target-dbinfo) stamp
+		  (db-file-info redo-current-target) target-dbinfo)))))
     0))
 
 (defun redo-stamp-main (args)

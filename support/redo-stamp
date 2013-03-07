@@ -1,0 +1,3 @@
+#!/bin/bash
+set -e
+redo-stamp2 $(md5sum)
