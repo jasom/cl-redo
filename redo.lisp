@@ -14,6 +14,7 @@
 (defvar *redo-dbpath*)
 (defvar *redo-start-time*)
 (defparameter *redo-db-type* :fs)
+(defparameter *path-to-redo-dir* "/export/jmiller/home/src/lisp/redo/build")
 
 (defmacro with-temp-fd ((fd-var name-var &optional (template "") ignore-unlink-errors) &body body)
     `(multiple-value-bind (,fd-var ,name-var) (isys:mkstemp ,template)
@@ -51,7 +52,6 @@
 
 ;;; "redo" goes here. Hacks and glory await!
 
-(defparameter *path-to-redo-dir* "/export/jmiller/home/src/lisp/redo/build")
 
 (defun shebang (doname)
   (let*
@@ -59,8 +59,8 @@
        (str
 	(unwind-protect
 	     (cffi:with-foreign-pointer-as-string (p 1024)
-	       (isys:read fd p 1023)
-	       (setf (cffi:mem-ref p :char 1023) 0))
+	       (let ((nbytes (isys:read fd p 1023)))
+		 (setf (cffi:mem-ref p :char nbytes) 0)))
 	  (isys:close fd)))
        (newline
 	(position #\Newline str))
@@ -253,6 +253,22 @@
 	     "")
 	    )))))
 
+(defun fix-file-path (file)
+  "Finds canonical path for file;
+
+The file's directory must at least exist"
+  (let
+      ((directory
+	(iolib/os:directory-exists-p 
+	 (make-file-path
+	  :components (file-path-directory file)
+	  :defaults file))))
+    (when directory
+      (merge-file-paths
+       (file-path-file file)
+       directory))))
+       
+
 (defgeneric %db-file-info (db-type file))
 (defgeneric (setf %db-file-info) (value db-type file))
 (defgeneric %makunbound-db-file-info (db-type file))
@@ -261,10 +277,14 @@
   (%makunbound-db-file-info *redo-db-type* file))
 
 (defun db-file-info (file &aux (file (file-path file)))
-  (%db-file-info *redo-db-type* file))
+  (let ((fixed-file (fix-file-path file)))
+    (assert fixed-file)
+  (%db-file-info *redo-db-type* (file-path file))))
 
 (defun (setf db-file-info) (value file &aux (file (file-path file)))
-  (setf (%db-file-info *redo-db-type* file) value))
+  (let ((fixed-file (fix-file-path file)))
+    (assert fixed-file)
+  (setf (%db-file-info *redo-db-type* fixed-file) value)))
 
 (defstruct dbinfo
   (last-run 0 :type integer)
@@ -400,7 +420,6 @@
 	  (and
 	   (not (consp target))
 	   (db-file-info target))))
-  (error-write (format nil "~%out-of-date-p ~a ~%" target))
   (cond
     ((and (consp target) (eql (car target) :create))
      (error-fmt "ifcreate target; will check if it exists~%")
@@ -429,19 +448,28 @@
     
     (t
      (error-write "Checking deps")
-     (loop for (target old-type . old-stamp) in (dbinfo-deps dbinfo)
-	for (new-type . new-stamp) in
-	  (mapcar (compose #'get-stamp #'car)  (dbinfo-deps dbinfo))
-	when
-	  (or
-	   (not (eql old-type new-type))
-	   (eql old-type :always)
-	   (and (eql old-type :time)
-		(< old-stamp new-stamp))
-	   (and (eql old-type :hash)
-		(string/= old-stamp new-stamp)))
-	return t
-	finally (return nil))))))
+     (loop
+	for (target old-type . old-stamp) in (dbinfo-deps dbinfo)
+	  do
+	  (cond
+	    ((and (consp target)
+		  (eql (car target) :create))
+	     (when
+		 (iolib/os:file-exists-p (cdr target))
+	       (return t)))
+	    ((eql old-type :always)
+	       (return t))
+	    ((and (out-of-date-p target) (not (eql old-type :hash)))
+	     (return t))
+	    ((and (eql old-type :hash)
+		  (not (equal (get-stamp target)
+			      (cons old-type old-stamp))))
+	     (return t))
+	    ((and (eql old-type :time)
+		  (and (iolib/os:file-exists-p target)
+		      (< old-stamp (get-file-nsec target))))
+	     (return t))
+	    (t nil)))))))
 
 (defun main (args)
   (error-fmt "ARGS: ~A~%~%" args)
@@ -450,15 +478,35 @@
        (exec-file (file-path exec-name))
        (command-name (file-path-file exec-file))
        (command (make-keyword (string-upcase command-name))))
+    (isys:exit
     (case command
       (:redo (redo-main args))
       (:redo-ifchange (redo-ifchange-main args))
       (:redo-stamp (redo-stamp-main args))
+      (:redo-stamp2 (redo-stamp2-main args))
       (:redo-always (redo-always-main args))
-      (:redo-ifcreate (redo-ifcreate-main args)))))
+      (:redo-ifcreate (redo-ifcreate-main args))))))
+
+(defun read-nul-string (stream)
+  (with-output-to-string (string)
+    (loop
+       for char = (read-char stream)
+       while (char/= #\Nul char)
+       do (write-char char string))))
+
+(defun read-nul-string-list (stream)
+  (loop
+       for string = (read-nul-string stream)
+       while (string/= "" string)
+       collect string))
+
+(defun split-env (string)
+  (let
+      ((pos (position #\= string)))
+    (cons (subseq string 0 pos)
+	  (subseq string (1+ pos)))))
 
 (defun redo-main (args)
-  (isys:exit 
   (catch 'exit
     ;Nested invocations of redo establish a new environment for building
     ;Or do they?
@@ -475,12 +523,11 @@
       (error-write (format nil "Redo:~{ ~A~}~%" targets))
       ;(mapc #'out-of-date-p targets) ; will build deps
       (mapc #'run-target targets))
-    0)))
+    0))
 
 (defun redo-stamp-main (args)
   (declare (ignore args))
   (setup-env)
-  (isys:exit
    (catch 'exit
      (multiple-value-bind
 	   (code out err)
@@ -496,10 +543,9 @@
 		   ((target-dbinfo (db-file-info redo-current-target)))
 		    (setf (dbinfo-stamp target-dbinfo) out
 			  (db-file-info redo-current-target) target-dbinfo))))))
-     0)))
+     0))
 
 (defun redo-always-main (args)
-  (isys:exit 
   (catch 'exit
     (setup-env)
     (unless (= (length args) 1)
@@ -512,10 +558,9 @@
 			 (dbinfo-deps target-dbinfo) :test #'equal)
 
 	  (setf (db-file-info redo-current-target) target-dbinfo))))
-    0)))
+    0))
 
 (defun redo-ifcreate-main (args)
-  (isys:exit 
   (catch 'exit
     (setup-env)
     (let* ((targets (cdr args))
@@ -538,11 +583,10 @@
 	     else do (push (cons (cons :create (file-path-namestring target)) '(:create . :create)) old-deps))
 	  (setf (dbinfo-deps target-dbinfo) old-deps
 		(db-file-info redo-current-target) target-dbinfo))))
-    0)))
+    0))
   
 
 (defun redo-ifchange-main (args)
-  (isys:exit 
   (catch 'exit
     (setup-env)
     (let* ((targets (cdr args))
@@ -566,14 +610,13 @@
 	       else do (push (cons (file-path-namestring target) dep) old-deps))
 	    (setf (dbinfo-deps target-dbinfo) old-deps
 		  (db-file-info redo-current-target) target-dbinfo)))))
-    0)))
+    0))
 
 (defun error-fmt (str &rest r)
   (error-write (apply #'format nil str r)))
 
 ;(defun error-write (str)
-  ;(cffi:with-foreign-pointer-as-string (s (1+ (length str)))
-  ;(isys:write 2 (cffi:lisp-string-to-foreign str s (1+ (length str))) (length str))))
+;  (cffi:with-foreign-pointer-as-string (s (1+ (length str)))
+;  (isys:write 2 (cffi:lisp-string-to-foreign str s (1+ (length str))) (length str))))
 
 (defun error-write (str) (declare (ignore str)) nil)
-;(trace db-file-info)
