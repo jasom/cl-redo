@@ -3,6 +3,7 @@
 (defvar *redodb-kv-socket*)
 
 (defmethod open-db ((type (eql :kv)))
+  (when (not (boundp '*redodb-kv-socket*))
   (assert (absolute-file-path-p *redo-dbpath*))
   (unless (iolib/os:directory-exists-p *redo-dbpath*)
     (ensure-file-path-directory-exists *redo-dbpath* #o700))
@@ -19,7 +20,7 @@
 				(merge-file-paths ".kvsock"
 						  *redo-dbpath*))))
 	(setf (iolib/os:environment-variable "REDO_DBSOCK")
-	      (prin1-to-string (iolib/sockets:socket-os-fd *redodb-kv-socket*))))))
+	      (prin1-to-string (iolib/sockets:socket-os-fd *redodb-kv-socket*)))))))
 
 (defmethod %db-file-info ((type (eql :kv)) file)
   (error-fmt "dfi: ~S~%" file)
