@@ -475,7 +475,7 @@ The file's directory must at least exist"
 
 (defun main (args)
   (error-fmt "ARGS: ~A~%~%" args)
-			 
+  		 
   (let*
       ((exec-name (car args))
        (exec-file (file-path exec-name))
@@ -514,8 +514,35 @@ The file's directory must at least exist"
     (cons (subseq string 0 pos)
 	  (subseq string (1+ pos)))))
 
+(cffi:defcallback child-handler :void ((v :int))
+  (declare (ignore v)))
+
+(defun nochldwait ()
+  (cffi:with-foreign-object (action 'isys:sigaction)
+    (setf
+     (cffi:foreign-slot-value action 'isys:sigaction 'isys:handler)
+     (cffi:get-callback 'child-handler)
+     (cffi:foreign-slot-value action 'isys:sigaction 'isys:sigaction)
+     (cffi:null-pointer)
+     (cffi:foreign-slot-value action 'isys:sigaction 'isys::mask) 0
+     (cffi:foreign-slot-value action 'isys:sigaction 'isys::flags)
+     isys:SA-NOCLDWAIT)
+    (iolib/syscalls:sigaction isys:SIGCHLD action (cffi:null-pointer))))
+
+(defun yeschldwait ()
+  (cffi:with-foreign-object (action 'isys:sigaction)
+    (setf
+     (cffi:foreign-slot-value action 'isys:sigaction 'isys:handler)
+     (cffi:get-callback 'child-handler)
+     (cffi:foreign-slot-value action 'isys:sigaction 'isys:sigaction)
+     (cffi:null-pointer)
+     (cffi:foreign-slot-value action 'isys:sigaction 'isys::mask) 0
+     (cffi:foreign-slot-value action 'isys:sigaction 'isys::flags)
+     0)
+    (iolib/syscalls:sigaction isys:SIGCHLD action (cffi:null-pointer))))
 (defun server-main (args)
   (setup-env)
+  
   (multiple-value-bind (server-control client-control)
       (iolib/sockets:make-socket-pair)
     (setf (iolib/os:environment-variable "REDO_SERVER_SOCKFD")
@@ -527,6 +554,7 @@ The file's directory must at least exist"
 		  (iolib/os:environment-variable "PATH")))
     (let ((pid (iolib/syscalls:fork)))
       (when (= pid 0)
+	(nochldwait)
 	(loop
 	   (let* ((args (read-nul-string-list server-control))
 		  (pid (parse-integer (read-nul-string server-control)))
@@ -538,6 +566,7 @@ The file's directory must at least exist"
 		  (var . val) in (mapcar #'split-env env-vars)
 		do (setf (iolib/os:environment-variable var) val))
 	     (when (= 0 (isys:fork))
+	       (yeschldwait)
 		 (iolib/os:with-current-directory cwd
 		   (let ((rv (main args)))
 		     (error-fmt "Client main done: ~D~%" rv)
@@ -549,7 +578,7 @@ The file's directory must at least exist"
 	(isys:kill pid isys:SIGKILL)
 	;(write-sequence (make-string 40 :initial-element #\Nul) client-control)
 	;(finish-output server-control)
-	(isys:waitpid pid 0)
+	;(isys:waitpid pid 0)
 	(isys:exit rv)))))
 
 (defun redo-main (args)
