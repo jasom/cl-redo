@@ -5,7 +5,7 @@
 ;; Make Jobserver (obvious since we don't support -j anyway)
 
 (in-package #:redo)
-(declaim (optimize (speed 3)))
+(declaim (optimize (space 3)))
 
 (defvar *out-of-date-cache* (make-hash-table :test #'equal))
 
@@ -14,7 +14,9 @@
 (defvar *redo-dbpath*)
 (defvar *redo-start-time*)
 (defparameter *redo-db-type* :fs)
-(defparameter *path-to-redo-dir* "/export/jmiller/home/src/lisp/redo/build")
+(defvar *path-to-redo-dir*)
+
+(declaim (ftype (function (t) string) file-path-namestring))
 
 (defmacro with-temp-fd ((fd-var name-var &optional (template "") ignore-unlink-errors) &body body)
     `(multiple-value-bind (,fd-var ,name-var) (isys:mkstemp ,template)
@@ -27,28 +29,6 @@
 	       (isys:unlink ,name-var))
 	     `(isys:unlink ,name-var)))))
 
-#|
-(defun run-program (program arguments &key (search t) stdout stderr stdin environment)
-  (iolib.os::with-posix-spawn-arguments (attributes file-actions pid)
-    (iolib.os::with-argv (argv program arguments)
-    (iolib.os::with-c-environment (environment)
-      (when stdout
-	(iolib.os::posix-spawn-file-actions-adddup2 file-actions stdout iolib.os::+stdout+))
-      (when stdin
-	(iolib.os::posix-spawn-file-actions-adddup2 file-actions stdin iolib.os::+stdin+))
-      (when stderr
-	(iolib.os::posix-spawn-file-actions-adddup2 file-actions stderr iolib.os::+stderr+))
-      (cffi:with-foreign-string (cfile program)
-	(if search
-	    (iolib.os::posix-spawnp pid cfile file-actions attributes argv isys:*environ*)
-	    (iolib.os::posix-spawn  pid cfile file-actions attributes argv isys:*environ*)))
-      (let ((pid (cffi:mem-ref pid 'isys:pid-t)))
-	(multiple-value-bind (_ rc)
-	(isys:waitpid pid 0)
-	  (declare (ignore _))
-	  rc))))))
-|#
-
 
 ;;; "redo" goes here. Hacks and glory await!
 
@@ -60,6 +40,7 @@
 	(unwind-protect
 	     (cffi:with-foreign-pointer-as-string (p 1024)
 	       (let ((nbytes (isys:read fd p 1023)))
+		 (assert (>= nbytes 0))
 		 (setf (cffi:mem-ref p :char nbytes) 0)))
 	  (isys:close fd)))
        (newline
@@ -67,9 +48,12 @@
        (line
 	(and newline
 	     (subseq str 0 newline))))
+
+    (declare (type string str)
+	     (type (or null string) line))
        (when
 	   (and line
-	   (string= "#!" (subseq line 0 2)))
+	   (string= "#!" (subseq line 0 2))) ;
 	 (split-sequence #\Space (subseq line 2) :count 2))))
 
 
@@ -135,6 +119,7 @@
 			:stdout stdout
 			:stderr iolib/os:+stderr+
 			:environment environment)))
+		 (declare (type fixnum return-code))
 		 (error-write (format nil "~A~%" cmd))
 		 (cond
 		   ;WTF Redo, I mean seriously why can we touch $1 if it's
@@ -153,7 +138,8 @@
 			     "Script wrote to $1, which is disallowed! (~A ~A)~%" doname target))
 		    nil)
 		   ((and
-		     (> (isys:stat-size (isys:fstat stdout)) 0)
+		     (>
+		      (the integer (isys:stat-size (isys:fstat stdout))) 0)
 		     (iolib/os:file-exists-p outfilename))
 		    (error-write
 		     (format nil
@@ -277,14 +263,10 @@ The file's directory must at least exist"
   (%makunbound-db-file-info *redo-db-type* file))
 
 (defun db-file-info (file &aux (file (file-path file)))
-  (let ((fixed-file (fix-file-path file)))
-    (assert fixed-file)
-  (%db-file-info *redo-db-type* (file-path file))))
+  (%db-file-info *redo-db-type* (file-path file)))
 
 (defun (setf db-file-info) (value file &aux (file (file-path file)))
-  (let ((fixed-file (fix-file-path file)))
-    (assert fixed-file)
-  (setf (%db-file-info *redo-db-type* fixed-file) value)))
+  (setf (%db-file-info *redo-db-type* file) value))
 
 (defstruct dbinfo
   (last-run 0 :type integer)
@@ -294,8 +276,10 @@ The file's directory must at least exist"
   (deps nil :type list))
 
 (defun get-file-nsec (target)
-  (* 1000000000
-     (isys:stat-mtime (isys:stat (file-path-namestring target)))))
+  (coerce
+   (* 1000000000
+      (isys:stat-mtime (isys:stat (file-path-namestring target))))
+   'integer))
 
 (defun ensure-file-path-directory-exists (path mode &aux (path (file-path path)))
   "Ensures that the directory containing path exists"
@@ -318,6 +302,7 @@ The file's directory must at least exist"
 	 (dbinfo (or
 		  (db-file-info target)
 		  (setf (db-file-info target) (make-dbinfo)))))
+    (declare (type (or null (cons file-path string)) dof))
     (when dof
       (setf (dbinfo-last-run dbinfo) (get-nsec)
 	    (dbinfo-deps dbinfo) (list (cons
@@ -335,7 +320,7 @@ The file's directory must at least exist"
 		target
 		(subseq (file-path-namestring target) 0
 			(- (length (file-path-namestring target))
-			   (length (cdr dof)))))))
+			   (length (the string (cdr dof))))))))
 	 (dbinfo
 	  (or
 	   (db-file-info target)
@@ -473,11 +458,16 @@ The file's directory must at least exist"
 
 (defun main (args)
   (error-fmt "ARGS: ~A~%~%" args)
+			 
   (let*
       ((exec-name (car args))
        (exec-file (file-path exec-name))
        (command-name (file-path-file exec-file))
        (command (make-keyword (string-upcase command-name))))
+    (setf *path-to-redo-dir*
+	(iolib/os:directory-exists-p
+	 (make-file-path :components (file-path-directory exec-name)
+			 :defaults exec-name)))
     (isys:exit
     (case command
       (:redo (redo-main args))
@@ -501,6 +491,7 @@ The file's directory must at least exist"
        collect string))
 
 (defun split-env (string)
+  (declare (type string string))
   (let
       ((pos (position #\= string)))
     (cons (subseq string 0 pos)
@@ -533,7 +524,9 @@ The file's directory must at least exist"
 	   (code out err)
 	 (iolib/os:run-program '("md5sum") :stdin iolib/os:+stdin+
 			       :stderr iolib/os:+stderr+)
-       (declare (ignore err))
+       (declare (ignore err)
+		(type fixnum code)
+		(type string out))
        (if (or (/= code 0)
 	       (= (length out) 0))
 	   (throw 'exit 1)
@@ -616,7 +609,9 @@ The file's directory must at least exist"
   (error-write (apply #'format nil str r)))
 
 ;(defun error-write (str)
-;  (cffi:with-foreign-pointer-as-string (s (1+ (length str)))
-;  (isys:write 2 (cffi:lisp-string-to-foreign str s (1+ (length str))) (length str))))
+;  (let ((buf (babel:string-to-octets str)))
+;  ;(cffi:with-foreign-pointer-as-string (s (1+ (length str)))
+;    (cffi:with-pointer-to-vector-data (ptr buf)
+;  (isys:write 2 ptr (length buf)))))
 
 (defun error-write (str) (declare (ignore str)) nil)
