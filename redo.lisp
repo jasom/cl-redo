@@ -5,7 +5,7 @@
 ;; Make Jobserver (obvious since we don't support -j anyway)
 
 (in-package #:redo)
-(declaim (optimize (space 3)))
+(declaim (optimize (speed 3)))
 
 (defvar *out-of-date-cache* (make-hash-table :test #'equal))
 
@@ -350,7 +350,12 @@ The file's directory must at least exist"
 	   (cons :time (get-file-nsec target))
 	   (cond
 	     ((find-do-file target)
-	      (when (out-of-date-p target)
+	      (when
+                (and
+                  (out-of-date-p target)
+                  (or (not dbinfo)
+                      (< (dbinfo-last-run dbinfo)
+                     *redo-start-time*)))
 		(setf dbinfo (run-target target)))
 	      (if (dbinfo-stamp dbinfo)
 		  (cons :hash (dbinfo-stamp dbinfo))
@@ -481,11 +486,7 @@ The file's directory must at least exist"
        (exec-file (file-path exec-name))
        (command-name (file-path-file exec-file))
        (command (make-keyword (string-upcase command-name))))
-    (setf *path-to-redo-dir*
-	(iolib/os:directory-exists-p
-	 (make-file-path :components (file-path-directory exec-name)
-			 :defaults exec-name)))
-    (isys:exit
+    
     (case command
       (:redo (redo-main args))
       (:redo-ifchange (redo-ifchange-main args))
